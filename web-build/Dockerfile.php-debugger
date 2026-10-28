@@ -2,29 +2,16 @@
 # Dockerfile to replace xdebug.so with php-debugger at build time.
 # php-debugger is a lightweight fork of Xdebug (step-debug only, ~4% overhead).
 # This piggybacks on DDEV's built-in `ddev xdebug on/off` mechanism.
+#
+# Replaces xdebug.so for EVERY PHP version installed in the image, not only the
+# default `php` binary: DDEV web images ship several PHP versions and the
+# project may use any of them. During build, `php` points to the image default,
+# which often differs from the project's configured php_version.
 
 ARG BASE_IMAGE
 FROM $BASE_IMAGE
 
 RUN set -eu; \
-    PHP_MAJOR=$(php -r 'echo PHP_MAJOR_VERSION;'); \
-    PHP_MINOR=$(php -r 'echo PHP_MINOR_VERSION;'); \
-    echo "Detected PHP ${PHP_MAJOR}.${PHP_MINOR}"; \
-    \
-    # Version guard: php-debugger requires PHP 8.2+ \
-    if [ "$PHP_MAJOR" -lt 8 ] || { [ "$PHP_MAJOR" -eq 8 ] && [ "$PHP_MINOR" -lt 2 ]; }; then \
-        echo "ERROR: php-debugger requires PHP 8.2 or later (detected ${PHP_MAJOR}.${PHP_MINOR})." >&2; \
-        exit 1; \
-    fi; \
-    \
-    # Locate the current xdebug.so for the active PHP version \
-    PHP_EXT_DIR=$(php -r 'echo ini_get("extension_dir");'); \
-    XDEBUG_SO="${PHP_EXT_DIR}/xdebug.so"; \
-    if [ ! -f "$XDEBUG_SO" ]; then \
-        echo "ERROR: Could not find xdebug.so at ${XDEBUG_SO}. Is Xdebug installed?" >&2; \
-        exit 1; \
-    fi; \
-    echo "Found xdebug.so at ${XDEBUG_SO}"; \
     \
     # Detect architecture (DDEV web images are always Linux, NTS PHP builds) \
     case "$(dpkg --print-architecture 2>/dev/null || uname -m)" in \
@@ -39,36 +26,68 @@ RUN set -eu; \
         | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/'); \
     echo "Latest php-debugger release: ${RELEASE_TAG}"; \
     \
-    # Try to download the pre-built binary (available for linux/amd64 and linux/arm64, NTS) \
-    DOWNLOAD_URL="https://github.com/php-debugger/php-debugger/releases/download/${RELEASE_TAG}/php-debugger-php${PHP_MAJOR}.${PHP_MINOR}-nts-linux-${ARCH}.so"; \
-    echo "Trying pre-built binary: ${DOWNLOAD_URL}"; \
-    DOWNLOADED=0; \
-    if curl -fsSL -o /tmp/php-debugger.so "$DOWNLOAD_URL" 2>/dev/null; then \
-        DOWNLOADED=1; \
-        echo "Pre-built binary downloaded successfully."; \
-    else \
-        echo "Pre-built binary not available for PHP ${PHP_MAJOR}.${PHP_MINOR} on ${ARCH}, falling back to source build..."; \
+    REPLACED=0; \
+    BUILD_PKGS=""; \
+    # Iterate over every installed PHP CLI binary (php8.2, php8.3, php8.4, ...) \
+    for PHP_BIN in /usr/bin/php8.*; do \
+        [ -x "$PHP_BIN" ] || continue; \
+        PHP_VER=$(basename "$PHP_BIN" | sed 's/^php//'); \
+        PHP_MAJOR=${PHP_VER%%.*}; \
+        PHP_MINOR=${PHP_VER##*.}; \
+        # Version guard: php-debugger requires PHP 8.2+ \
+        if [ "$PHP_MAJOR" -lt 8 ] || { [ "$PHP_MAJOR" -eq 8 ] && [ "$PHP_MINOR" -lt 2 ]; }; then \
+            echo "Skipping PHP ${PHP_VER}: php-debugger requires PHP 8.2 or later."; \
+            continue; \
+        fi; \
+        EXT_DIR=$("$PHP_BIN" -r 'echo ini_get("extension_dir");'); \
+        XDEBUG_SO="${EXT_DIR}/xdebug.so"; \
+        if [ ! -f "$XDEBUG_SO" ]; then \
+            echo "Skipping PHP ${PHP_VER}: no xdebug.so in ${EXT_DIR}."; \
+            continue; \
+        fi; \
+        echo "Processing PHP ${PHP_VER} (${XDEBUG_SO})"; \
+        DOWNLOAD_URL="https://github.com/php-debugger/php-debugger/releases/download/${RELEASE_TAG}/php-debugger-php${PHP_VER}-nts-linux-${ARCH}.so"; \
+        TMP_SO="/tmp/php-debugger-${PHP_VER}.so"; \
+        DOWNLOADED=0; \
+        if curl -fsSL -o "$TMP_SO" "$DOWNLOAD_URL" 2>/dev/null; then \
+            DOWNLOADED=1; \
+            echo "Pre-built binary downloaded for PHP ${PHP_VER}."; \
+        else \
+            echo "Pre-built binary not available for PHP ${PHP_VER} on ${ARCH}, building from source..."; \
+        fi; \
+        if [ "$DOWNLOADED" = "0" ]; then \
+            apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+                php${PHP_VER}-dev autoconf automake gcc make git > /dev/null 2>&1; \
+            BUILD_PKGS="php${PHP_VER}-dev autoconf automake gcc make git"; \
+            git clone --depth 1 --branch "${RELEASE_TAG}" https://github.com/php-debugger/php-debugger.git /tmp/php-debugger-src; \
+            cd /tmp/php-debugger-src; \
+            phpize${PHP_VER}; \
+            ./configure --enable-php-debugger --with-php-config=/usr/bin/php-config${PHP_VER}; \
+            make -j"$(nproc)"; \
+            cp modules/php_debugger.so "$TMP_SO"; \
+            cd /; \
+            rm -rf /tmp/php-debugger-src; \
+        fi; \
+        # Backup the original only on first replacement; on rebuilds xdebug.so \
+        # is already php-debugger and must not overwrite the backup. \
+        if [ ! -f "${XDEBUG_SO}.original" ]; then \
+            cp "$XDEBUG_SO" "${XDEBUG_SO}.original"; \
+        fi; \
+        mv "$TMP_SO" "$XDEBUG_SO"; \
+        chmod 644 "$XDEBUG_SO"; \
+        echo "php-debugger installed for PHP ${PHP_VER} (original backed up to ${XDEBUG_SO}.original)"; \
+        REPLACED=1; \
+    done; \
+    \
+    if [ "$REPLACED" = "0" ]; then \
+        echo "ERROR: Could not find xdebug.so for any PHP version >= 8.2. Is Xdebug installed?" >&2; \
+        exit 1; \
     fi; \
-    if [ "$DOWNLOADED" = "0" ]; then \
-        # Build from source when no pre-built binary matches this PHP version/architecture \
-        echo "Building from source..."; \
-        apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-            php${PHP_MAJOR}.${PHP_MINOR}-dev autoconf automake gcc make git > /dev/null 2>&1; \
-        git clone --depth 1 --branch "${RELEASE_TAG}" https://github.com/php-debugger/php-debugger.git /tmp/php-debugger-src; \
-        cd /tmp/php-debugger-src; \
-        phpize; \
-        ./configure --enable-php-debugger; \
-        make -j"$(nproc)"; \
-        cp modules/php_debugger.so /tmp/php-debugger.so; \
-        cd /; \
-        rm -rf /tmp/php-debugger-src; \
-        apt-get purge -y -qq php${PHP_MAJOR}.${PHP_MINOR}-dev autoconf automake gcc make git > /dev/null 2>&1 || true; \
+    \
+    # Remove build dependencies if we built from source \
+    if [ -n "$BUILD_PKGS" ]; then \
+        apt-get purge -y -qq $BUILD_PKGS > /dev/null 2>&1 || true; \
         apt-get autoremove -y -qq > /dev/null 2>&1 || true; \
         rm -rf /var/lib/apt/lists/*; \
     fi; \
-    \
-    # Backup original and replace \
-    cp "$XDEBUG_SO" "${XDEBUG_SO}.original"; \
-    mv /tmp/php-debugger.so "$XDEBUG_SO"; \
-    chmod 644 "$XDEBUG_SO"; \
-    echo "php-debugger installed successfully (original backed up to ${XDEBUG_SO}.original)"
+    echo "php-debugger installed successfully"

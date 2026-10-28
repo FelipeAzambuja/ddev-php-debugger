@@ -48,10 +48,10 @@ Your IDE configuration (PHPStorm, VS Code, etc.) remains unchanged — php-debug
 
 At container build time, the addon:
 
-1. Detects the PHP version and architecture
+1. Detects every PHP version installed in the image (not just the default `php` binary, which may differ from the project's `php_version`) and the architecture
 2. Downloads the matching pre-built binary from GitHub releases (amd64 and arm64 are both supported)
 3. Falls back to compiling php-debugger from source if no pre-built binary matches your PHP version (first build takes ~40s)
-4. Backs up the original `xdebug.so` → `xdebug.so.original`
+4. Backs up the original `xdebug.so` → `xdebug.so.original` (only on first replacement, so rebuilds don't overwrite the backup)
 5. Replaces `xdebug.so` with the php-debugger binary
 
 The addon also overrides `xdebug.mode` to `debug` (instead of DDEV's default `debug,develop`) since php-debugger only supports step-debugging.
